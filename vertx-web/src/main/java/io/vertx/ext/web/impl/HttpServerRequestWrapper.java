@@ -1,56 +1,127 @@
 package io.vertx.ext.web.impl;
 
+import io.netty.handler.codec.http.QueryStringDecoder;
+import io.vertx.codegen.annotations.Nullable;
+import io.vertx.core.AsyncResult;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.MultiMap;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.*;
 import io.vertx.core.net.NetSocket;
 import io.vertx.core.net.SocketAddress;
+import io.vertx.core.streams.Pipe;
+import io.vertx.core.streams.WriteStream;
+import io.vertx.ext.web.AllowForwardHeaders;
 
 import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSession;
 import javax.security.cert.X509Certificate;
-import java.net.MalformedURLException;
-import java.net.URL;
+import java.util.List;
+import java.util.Map;
 
 class HttpServerRequestWrapper implements HttpServerRequest {
 
   private final HttpServerRequest delegate;
+  private final ForwardedParser forwardedParser;
+
+  private boolean modified;
+
   private HttpMethod method;
   private String path;
+  private String query;
   private String uri;
   private String absoluteURI;
+  private MultiMap params;
 
-  HttpServerRequestWrapper(HttpServerRequest request) {
+  HttpServerRequestWrapper(HttpServerRequest request, AllowForwardHeaders allowForward) {
     delegate = request;
-    method = request.method();
-    path = request.path();
-    uri = request.uri();
-    absoluteURI = null;
+    forwardedParser = new ForwardedParser(delegate, allowForward);
+  }
+
+  void changeTo(HttpMethod method, String uri) {
+    modified = true;
+    this.method = method;
+    this.uri = uri;
+    // lazy initialization
+    this.path = null;
+    this.query = null;
+    this.absoluteURI = null;
+
+    // parse
+    int queryIndex = uri.indexOf('?');
+
+    // there's a query
+    if (queryIndex != -1) {
+      int fragmentIndex = uri.indexOf('#', queryIndex);
+      path = uri.substring(0, queryIndex);
+      // there's a fragment
+      if (fragmentIndex != -1) {
+        query = uri.substring(queryIndex + 1, fragmentIndex);
+      } else {
+        query = uri.substring(queryIndex + 1);
+      }
+    } else {
+      int fragmentIndex = uri.indexOf('#');
+      // there's a fragment
+      if (fragmentIndex != -1) {
+        path = uri.substring(0, fragmentIndex);
+      } else {
+        path = uri;
+      }
+    }
+  }
+
+  @Override
+  public HttpServerRequest body(Handler<AsyncResult<Buffer>> handler) {
+    delegate.body(handler);
+    return this;
+  }
+
+  @Override
+  public Future<Buffer> body() {
+    return delegate.body();
+  }
+
+  @Override
+  public long bytesRead() {
+    return delegate.bytesRead();
   }
 
   @Override
   public HttpServerRequest exceptionHandler(Handler<Throwable> handler) {
-    return delegate.exceptionHandler(handler);
+    delegate.exceptionHandler(handler);
+    return this;
   }
 
   @Override
   public HttpServerRequest handler(Handler<Buffer> handler) {
-    return delegate.handler(handler);
+    delegate.handler(handler);
+    return this;
   }
 
   @Override
   public HttpServerRequest pause() {
-    return delegate.pause();
+    delegate.pause();
+    return this;
   }
 
   @Override
   public HttpServerRequest resume() {
-    return delegate.resume();
+    delegate.resume();
+    return this;
+  }
+
+  @Override
+  public HttpServerRequest fetch(long amount) {
+    delegate.fetch(amount);
+    return this;
   }
 
   @Override
   public HttpServerRequest endHandler(Handler<Void> handler) {
-    return delegate.endHandler(handler);
+    delegate.endHandler(handler);
+    return this;
   }
 
   @Override
@@ -58,41 +129,67 @@ class HttpServerRequestWrapper implements HttpServerRequest {
     return delegate.version();
   }
 
-  HttpServerRequest setMethod(HttpMethod method) {
-    this.method = method;
-    return this;
-  }
-
   @Override
   public HttpMethod method() {
+    if (!modified) {
+      return delegate.method();
+    }
     return method;
   }
 
   @Override
-  public String rawMethod() {
-    return delegate.rawMethod();
-  }
-
-  @Override
   public String uri() {
+    if (!modified) {
+      return delegate.uri();
+    }
     return uri;
-  }
-
-  void setPath(String path) {
-    this.path = path;
-    // when overriding the path we also need to rewrite the uri and absoluteURI
-    uri = path;
-    absoluteURI = null;
   }
 
   @Override
   public String path() {
+    if (!modified) {
+      return delegate.path();
+    }
     return path;
   }
 
   @Override
   public String query() {
-    return delegate.query();
+    if (!modified) {
+      return delegate.query();
+    }
+    return query;
+  }
+
+  @Override
+  public MultiMap params() {
+    if (!modified) {
+      return delegate.params();
+    }
+    if (params == null) {
+      params = MultiMap.caseInsensitiveMultiMap();
+      // if there is no query it's not really needed to parse it
+      if (query != null) {
+        QueryStringDecoder queryStringDecoder = new QueryStringDecoder(uri);
+        Map<String, List<String>> prms = queryStringDecoder.parameters();
+        if (!prms.isEmpty()) {
+          for (Map.Entry<String, List<String>> entry: prms.entrySet()) {
+            params.add(entry.getKey(), entry.getValue());
+          }
+        }
+      }
+    }
+
+    return params;
+  }
+
+  @Override
+  public String getParam(String param) {
+    if (!modified) {
+      return delegate.getParam(param);
+    }
+
+    return params().get(param);
   }
 
   @Override
@@ -116,18 +213,8 @@ class HttpServerRequestWrapper implements HttpServerRequest {
   }
 
   @Override
-  public MultiMap params() {
-    return delegate.params();
-  }
-
-  @Override
-  public String getParam(String s) {
-    return delegate.getParam(s);
-  }
-
-  @Override
   public SocketAddress remoteAddress() {
-    return delegate.remoteAddress();
+    return forwardedParser.remoteAddress();
   }
 
   @Override
@@ -141,34 +228,44 @@ class HttpServerRequestWrapper implements HttpServerRequest {
   }
 
   @Override
+  public SSLSession sslSession() {
+    return delegate.sslSession();
+  }
+
+  @Override
   public String absoluteURI() {
-    if (absoluteURI == null) {
-      try {
-        URL url = new URL(delegate.absoluteURI());
-        URL newUrl = new URL(url.getProtocol(), url.getHost(), url.getPort(), uri);
+    if (!modified) {
+      return forwardedParser.absoluteURI();
+    } else {
+      if (absoluteURI == null) {
+        String scheme = forwardedParser.scheme();
+        String host = forwardedParser.host();
 
-        absoluteURI = newUrl.toExternalForm();
-      } catch (MalformedURLException e) {
-        throw new RuntimeException(e);
+        // if both are not null we can rebuild the uri
+        if (scheme != null && host != null) {
+          absoluteURI = scheme + "://" + host + uri;
+        } else {
+          absoluteURI = uri;
+        }
       }
-    }
 
-    return absoluteURI;
+      return absoluteURI;
+    }
   }
 
   @Override
   public String scheme() {
-    return delegate.scheme();
+    return forwardedParser.scheme();
   }
 
   @Override
   public String host() {
-    return delegate.host();
+    return forwardedParser.host();
   }
 
   @Override
-  public HttpServerRequest unknownFrameHandler(Handler<HttpFrame> handler) {
-    delegate.unknownFrameHandler(handler);
+  public HttpServerRequest customFrameHandler(Handler<HttpFrame> handler) {
+    delegate.customFrameHandler(handler);
     return this;
   }
 
@@ -179,17 +276,24 @@ class HttpServerRequestWrapper implements HttpServerRequest {
 
   @Override
   public HttpServerRequest bodyHandler(Handler<Buffer> handler) {
-    return delegate.bodyHandler(handler);
+    delegate.bodyHandler(handler);
+    return this;
   }
 
   @Override
-  public NetSocket netSocket() {
-    return delegate.netSocket();
+  public void toNetSocket(Handler<AsyncResult<NetSocket>> handler) {
+    delegate.toNetSocket(handler);
+  }
+
+  @Override
+  public Future<NetSocket> toNetSocket() {
+    return delegate.toNetSocket();
   }
 
   @Override
   public HttpServerRequest setExpectMultipart(boolean b) {
-    return delegate.setExpectMultipart(b);
+    delegate.setExpectMultipart(b);
+    return this;
   }
 
   @Override
@@ -199,7 +303,8 @@ class HttpServerRequestWrapper implements HttpServerRequest {
 
   @Override
   public HttpServerRequest uploadHandler(Handler<HttpServerFileUpload> handler) {
-    return delegate.uploadHandler(handler);
+    delegate.uploadHandler(handler);
+    return this;
   }
 
   @Override
@@ -213,8 +318,21 @@ class HttpServerRequestWrapper implements HttpServerRequest {
   }
 
   @Override
-  public ServerWebSocket upgrade() {
-    return delegate.upgrade();
+  public void toWebSocket(Handler<AsyncResult<ServerWebSocket>> handler) {
+    delegate.toWebSocket(toWebSocket -> {
+      if (toWebSocket.succeeded()) {
+        handler.handle(Future.succeededFuture(
+          new ServerWebSocketWrapper(toWebSocket.result(), host(), scheme(), isSSL(), remoteAddress())));
+      } else {
+        handler.handle(toWebSocket);
+      }
+    });
+  }
+
+  @Override
+  public Future<ServerWebSocket> toWebSocket() {
+    return delegate.toWebSocket()
+      .map(ws -> new ServerWebSocketWrapper(ws, host(), scheme(), isSSL(), remoteAddress()));
   }
 
   @Override
@@ -222,7 +340,65 @@ class HttpServerRequestWrapper implements HttpServerRequest {
     return delegate.isEnded();
   }
 
+  @Override
   public boolean isSSL() {
-    return delegate.isSSL();
+    return forwardedParser.isSSL();
+  }
+
+  @Override
+  public HttpServerRequest streamPriorityHandler(Handler<StreamPriority> handler) {
+    delegate.streamPriorityHandler(handler);
+    return this;
+  }
+
+  @Override
+  public StreamPriority streamPriority() {
+    return delegate.streamPriority();
+  }
+
+  @Override
+  public @Nullable Cookie getCookie(String name) {
+    return delegate.getCookie(name);
+  }
+
+  @Override
+  public int cookieCount() {
+    return delegate.cookieCount();
+  }
+
+  @Override
+  public Map<String, Cookie> cookieMap() {
+    return delegate.cookieMap();
+  }
+
+  @Override
+  public void end(Handler<AsyncResult<Void>> handler) {
+    delegate.end(handler);
+  }
+
+  @Override
+  public Future<Void> end() {
+    return delegate.end();
+  }
+
+  @Override
+  public HttpServerRequest routed(String route) {
+    delegate.routed(route);
+    return this;
+  }
+
+  @Override
+  public Pipe<Buffer> pipe() {
+    return delegate.pipe();
+  }
+
+  @Override
+  public Future<Void> pipeTo(WriteStream<Buffer> dst) {
+    return delegate.pipeTo(dst);
+  }
+
+  @Override
+  public void pipeTo(WriteStream<Buffer> dst, Handler<AsyncResult<Void>> handler) {
+    delegate.pipeTo(dst, handler);
   }
 }

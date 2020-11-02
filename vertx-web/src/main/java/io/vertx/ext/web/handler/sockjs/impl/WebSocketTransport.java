@@ -32,13 +32,16 @@
 
 package io.vertx.ext.web.handler.sockjs.impl;
 
+import io.vertx.core.AsyncResult;
+import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
+import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.ServerWebSocket;
-import io.vertx.core.http.WebSocketFrame;
-import io.vertx.core.logging.Logger;
-import io.vertx.core.logging.LoggerFactory;
+import io.vertx.core.impl.logging.Logger;
+import io.vertx.core.impl.logging.LoggerFactory;
+import io.vertx.core.net.impl.ConnectionBase;
 import io.vertx.core.shareddata.LocalMap;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.handler.sockjs.SockJSHandlerOptions;
@@ -46,6 +49,7 @@ import io.vertx.ext.web.handler.sockjs.SockJSSocket;
 
 /**
  * @author <a href="http://tfox.org">Tim Fox</a>
+ * @author <a href="mailto:plopes@redhat.com">Paulo Lopes</a>
  */
 class WebSocketTransport extends BaseTransport {
 
@@ -60,16 +64,31 @@ class WebSocketTransport extends BaseTransport {
 
     router.getWithRegex(wsRE).handler(rc -> {
       HttpServerRequest req = rc.request();
-      String connectionHeader = req.headers().get(io.vertx.core.http.HttpHeaders.CONNECTION);
+      String connectionHeader = req.headers().get(HttpHeaders.CONNECTION);
       if (connectionHeader == null || !connectionHeader.toLowerCase().contains("upgrade")) {
         rc.response().setStatusCode(400);
         rc.response().end("Can \"Upgrade\" only to \"WebSocket\".");
       } else {
-        ServerWebSocket ws = rc.request().upgrade();
-        if (log.isTraceEnabled()) log.trace("WS, handler");
-        SockJSSession session = new SockJSSession(vertx, sessions, rc, options.getHeartbeatInterval(), sockHandler);
-        session.setInfo(ws.localAddress(), ws.remoteAddress(), ws.uri(), ws.headers());
-        session.register(new WebSocketListener(ws, session));
+        // we're about to upgrade the connection, which means an asynchronous
+        // operation. We have to pause the request otherwise we will loose the
+        // body of the request once the upgrade completes
+        rc.request().pause();
+        // upgrade
+        rc.request().toWebSocket(toWebSocket -> {
+          if (toWebSocket.succeeded()) {
+            if (log.isTraceEnabled()) {
+              log.trace("WS, handler");
+            }
+            // resume the parsing
+            rc.request().resume();
+            // handle the sockjs session as usual
+            SockJSSession session = new SockJSSession(vertx, sessions, rc, options, sockHandler);
+            session.register(req, new WebSocketListener(toWebSocket.result(), session));
+          } else {
+            // the upgrade failed
+            rc.fail(toWebSocket.cause());
+          }
+        });
       }
     });
 
@@ -81,7 +100,7 @@ class WebSocketTransport extends BaseTransport {
 
     router.routeWithRegex(wsRE).handler(rc -> {
       if (log.isTraceEnabled()) log.trace("WS, all: " + rc.request().uri());
-      rc.response().putHeader("Allow", "GET").setStatusCode(405).end();
+      rc.response().putHeader(HttpHeaders.ALLOW, "GET").setStatusCode(405).end();
     });
   }
 
@@ -94,20 +113,7 @@ class WebSocketTransport extends BaseTransport {
     WebSocketListener(ServerWebSocket ws, SockJSSession session) {
       this.ws = ws;
       this.session = session;
-      ws.handler(data -> {
-        if (!session.isClosed()) {
-          String msgs = data.toString();
-          if (msgs.equals("")) {
-            //Ignore empty frames
-          } else if ((msgs.startsWith("[\"") && msgs.endsWith("\"]")) ||
-                     (msgs.startsWith("\"") && msgs.endsWith("\""))) {
-            session.handleMessages(msgs);
-          } else {
-            //Invalid JSON - we close the connection
-            close();
-          }
-        }
-      });
+      ws.textMessageHandler(this::handleMessages);
       ws.closeHandler(v -> {
         closed = true;
         session.shutdown();
@@ -119,10 +125,29 @@ class WebSocketTransport extends BaseTransport {
       });
     }
 
-    public void sendFrame(final String body) {
+    private void handleMessages(String msgs) {
+      if (!session.isClosed()) {
+        if (msgs.equals("") || msgs.equals("[]")) {
+          //Ignore empty frames
+        } else if ((msgs.startsWith("[\"") && msgs.endsWith("\"]")) ||
+               (msgs.startsWith("\"") && msgs.endsWith("\""))) {
+          session.handleMessages(msgs);
+        } else {
+          //Invalid JSON - we close the connection
+          close();
+        }
+      }
+    }
+
+    @Override
+    public void sendFrame(String body, Handler<AsyncResult<Void>> handler) {
       if (log.isTraceEnabled()) log.trace("WS, sending frame");
       if (!closed) {
-        ws.writeFrame(WebSocketFrame.textFrame(body, true));
+        ws.writeTextMessage(body, handler);
+      } else {
+        if (handler != null) {
+          handler.handle(Future.failedFuture(ConnectionBase.CLOSED_EXCEPTION));
+        }
       }
     }
 
@@ -137,7 +162,9 @@ class WebSocketTransport extends BaseTransport {
     public void sessionClosed() {
       session.writeClosed(this);
       closed = true;
-      ws.close();
+      // Asynchronously close the websocket to fix a bug in the SockJS TCK
+      // due to the WebSocket client that skip some frames (bug)
+      session.context().runOnContext(v -> ws.close());
     }
 
   }

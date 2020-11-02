@@ -32,14 +32,14 @@
 
 package io.vertx.ext.web.handler.sockjs.impl;
 
-import io.vertx.core.Handler;
-import io.vertx.core.Vertx;
+import io.vertx.core.*;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.eventbus.Message;
 import io.vertx.core.eventbus.MessageConsumer;
-import io.vertx.ext.web.Session;
-import io.vertx.ext.web.handler.sockjs.SockJSSocket;
 import io.vertx.ext.auth.User;
+import io.vertx.ext.web.Session;
+import io.vertx.ext.web.handler.sockjs.SockJSHandlerOptions;
+import io.vertx.ext.web.handler.sockjs.SockJSSocket;
 
 import java.util.UUID;
 
@@ -63,13 +63,24 @@ public abstract class SockJSSocketBase implements SockJSSocket {
   @Override
   public abstract SockJSSocket exceptionHandler(Handler<Throwable> handler);
 
-  protected SockJSSocketBase(Vertx vertx, Session webSession, User webUser) {
+  protected SockJSSocketBase(Vertx vertx, Session webSession, User webUser, SockJSHandlerOptions options) {
     this.vertx = vertx;
     this.webSession = webSession;
     this.webUser = webUser;
-    Handler<Message<Buffer>> writeHandler = buff -> write(buff.body());
-    this.writeHandlerID = UUID.randomUUID().toString();
-    this.registration = vertx.eventBus().<Buffer>consumer(writeHandlerID).handler(writeHandler);
+    if (options.isRegisterWriteHandler()) {
+      Handler<Message<Buffer>> writeHandler = msg -> write(msg.body());
+      writeHandlerID = UUID.randomUUID().toString();
+      MessageConsumer<Buffer> consumer;
+      if (options.isLocalWriteHandler()) {
+        consumer = vertx.eventBus().localConsumer(writeHandlerID);
+      } else {
+        consumer = vertx.eventBus().consumer(writeHandlerID);
+      }
+      registration = consumer.handler(writeHandler);
+    } else {
+      writeHandlerID = null;
+      registration = null;
+    }
   }
 
   @Override
@@ -78,13 +89,33 @@ public abstract class SockJSSocketBase implements SockJSSocket {
   }
 
   @Override
-  public void end() {
-    close();
+  public Future<Void> end() {
+    Promise<Void> promise = Promise.promise();
+    if (registration != null) {
+      registration.unregister(promise);
+    } else {
+      promise.complete();
+    }
+    return promise.future();
+  }
+
+  @Override
+  public void end(Handler<AsyncResult<Void>> handler) {
+    if (registration != null) {
+      registration.unregister(handler);
+    } else {
+      handler.handle(Future.succeededFuture());
+    }
   }
 
   @Override
   public void close() {
-    registration.unregister();
+    end();
+  }
+
+  // Only websocket transport allows status code and reason, so in other cases we simply call close()
+  public void closeAfterSessionExpired() {
+    close();
   }
 
   @Override

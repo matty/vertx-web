@@ -17,9 +17,12 @@
 package io.vertx.ext.web.impl;
 
 import io.vertx.codegen.annotations.Nullable;
+import io.vertx.core.AsyncResult;
 import io.vertx.core.Handler;
+import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.Cookie;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
@@ -40,16 +43,33 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   protected final RoutingContext inner;
   private final String mountPoint;
 
-  public RoutingContextWrapper(String mountPoint, HttpServerRequest request, Set<RouteImpl> iter,
-                               RoutingContext inner) {
-    super(mountPoint, request, iter);
+  public RoutingContextWrapper(String mountPoint, Set<RouteImpl> iter, RoutingContext inner) {
+    super(mountPoint, iter);
     this.inner = inner;
     String parentMountPoint = inner.mountPoint();
-    if (mountPoint.charAt(mountPoint.length() - 1) == '/') {
-      // Remove the trailing slash or we won't match
-      mountPoint = mountPoint.substring(0, mountPoint.length() - 1);
+    if (parentMountPoint == null) {
+      // just use the override
+      this.mountPoint = mountPoint;
+    } else {
+      // special case: when a sub router is mounting on / basically it's telling
+      // that it wants to use the parent mount, otherwise it's extending the parent
+      // path
+      if ("/".equals(mountPoint)) {
+        this.mountPoint = parentMountPoint;
+      } else {
+        this.mountPoint = parentMountPoint + mountPoint;
+      }
     }
-    this.mountPoint = parentMountPoint == null ? mountPoint : parentMountPoint + mountPoint;
+  }
+
+  @Override
+  public RoutingContextInternal visitHandler(int id) {
+    return ((RoutingContextInternal) inner).visitHandler(id);
+  }
+
+  @Override
+  public boolean seenHandler(int id) {
+    return ((RoutingContextInternal) inner).seenHandler(id);
   }
 
   @Override
@@ -73,6 +93,11 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   }
 
   @Override
+  public void fail(int statusCode, Throwable throwable) {
+    inner.fail(statusCode, throwable);
+  }
+
+  @Override
   public RoutingContext put(String key, Object obj) {
     inner.put(key, obj);
     return this;
@@ -81,6 +106,11 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   @Override
   public <T> T get(String key) {
     return inner.get(key);
+  }
+
+  @Override
+  public <T> T remove(String key) {
+    return inner.remove(key);
   }
 
   @Override
@@ -114,13 +144,28 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   }
 
   @Override
+  public int addEndHandler(Handler<AsyncResult<Void>> handler) {
+    return inner.addEndHandler(handler);
+  }
+
+  @Override
+  public boolean removeEndHandler(int handlerID) {
+    return inner.removeEndHandler(handlerID);
+  }
+
+  @Override
   public void setSession(Session session) {
-   inner.setSession(session);
+    inner.setSession(session);
   }
 
   @Override
   public Session session() {
     return inner.session();
+  }
+
+  @Override
+  public boolean isSessionAccessed() {
+    return inner.isSessionAccessed();
   }
 
   @Override
@@ -141,7 +186,9 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   @Override
   public void next() {
     if (!super.iterateNext()) {
-      // We didn't route request to anything so go to parent
+      // We didn't route request to anything so go to parent,
+      // but also propagate the current status
+      ((RoutingContextInternal) inner).setMatchFailure(matchFailure);
       inner.next();
     }
   }
@@ -167,8 +214,8 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   }
 
   @Override
-  public String normalisedPath() {
-    return inner.normalisedPath();
+  public String normalizedPath() {
+    return inner.normalizedPath();
   }
 
   @Override
@@ -183,8 +230,8 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   }
 
   @Override
-  public Cookie removeCookie(String name) {
-    return inner.removeCookie(name);
+  public Cookie removeCookie(String name, boolean invalidate) {
+    return inner.removeCookie(name, invalidate);
   }
 
   @Override
@@ -193,8 +240,8 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   }
 
   @Override
-  public Set<Cookie> cookies() {
-    return inner.cookies();
+  public Map<String, io.vertx.core.http.Cookie> cookieMap() {
+    return inner.cookieMap();
   }
 
   @Override
@@ -208,13 +255,13 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   }
 
   @Override
-  public JsonObject getBodyAsJson() {
-    return inner.getBodyAsJson();
+  public JsonObject getBodyAsJson(int maxAllowedLength) {
+    return inner.getBodyAsJson(maxAllowedLength);
   }
 
   @Override
-  public JsonArray getBodyAsJsonArray() {
-    return inner.getBodyAsJsonArray();
+  public JsonArray getBodyAsJsonArray(int maxAllowedLength) {
+    return inner.getBodyAsJsonArray(maxAllowedLength);
   }
 
   @Override
@@ -238,6 +285,11 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   }
 
   @Override
+  public ParsedHeaderValues parsedHeaders() {
+    return inner.parsedHeaders();
+  }
+
+  @Override
   public void setAcceptableContentType(String contentType) {
     inner.setAcceptableContentType(contentType);
   }
@@ -248,11 +300,6 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   }
 
   @Override
-  public List<Locale> acceptableLocales() {
-    return inner.acceptableLocales();
-  }
-
-  @Override
   public Map<String, String> pathParams() {
     return inner.pathParams();
   }
@@ -260,6 +307,16 @@ public class RoutingContextWrapper extends RoutingContextImplBase {
   @Override
   public @Nullable String pathParam(String name) {
     return inner.pathParam(name);
+  }
+
+  @Override
+  public MultiMap queryParams() {
+    return inner.queryParams();
+  }
+
+  @Override
+  public @Nullable List<String> queryParam(String query) {
+    return inner.queryParam(query);
   }
 
 }

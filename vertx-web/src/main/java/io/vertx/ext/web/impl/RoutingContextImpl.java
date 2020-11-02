@@ -16,21 +16,19 @@
 
 package io.vertx.ext.web.impl;
 
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.QueryStringDecoder;
 import io.vertx.codegen.annotations.Nullable;
-import io.vertx.core.Handler;
-import io.vertx.core.Vertx;
+import io.vertx.core.*;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.HttpMethod;
-import io.vertx.core.http.HttpServerRequest;
-import io.vertx.core.http.HttpServerResponse;
+import io.vertx.core.http.*;
+import io.vertx.core.http.impl.HttpUtils;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.auth.User;
-import io.vertx.ext.web.Cookie;
-import io.vertx.ext.web.FileUpload;
-import io.vertx.ext.web.Locale;
-import io.vertx.ext.web.RoutingContext;
-import io.vertx.ext.web.Session;
+import io.vertx.ext.web.*;
+import io.vertx.ext.web.codec.impl.BodyCodecImpl;
+import io.vertx.ext.web.handler.impl.HttpStatusException;
 
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -41,29 +39,64 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class RoutingContextImpl extends RoutingContextImplBase {
 
   private final RouterImpl router;
+  private final HttpServerRequest request;
+  private final AtomicInteger handlerSeq = new AtomicInteger();
+
   private Map<String, Object> data;
   private Map<String, String> pathParams;
-  private AtomicInteger handlerSeq = new AtomicInteger();
+  private MultiMap queryParams;
   private Map<Integer, Handler<Void>> headersEndHandlers;
   private Map<Integer, Handler<Void>> bodyEndHandlers;
+  // clean up handlers
+  private Map<Integer, Handler<AsyncResult<Void>>> endHandlers;
+
   private Throwable failure;
   private int statusCode = -1;
-  private String normalisedPath;
+  private String normalizedPath;
   private String acceptableContentType;
+  private ParsableHeaderValuesContainer parsedHeaders;
 
-  // We use Cookie as the key too so we can return keySet in cookies() without copying
-  private Map<String, Cookie> cookies;
   private Buffer body;
   private Set<FileUpload> fileUploads;
   private Session session;
   private User user;
 
+  private volatile boolean isSessionAccessed = false;
+  private volatile boolean endHandlerCalled = false;
+
   public RoutingContextImpl(String mountPoint, RouterImpl router, HttpServerRequest request, Set<RouteImpl> routes) {
-    super(mountPoint, request, routes);
+    super(mountPoint, routes);
     this.router = router;
-    if (request.path().charAt(0) != '/') {
+    this.request = new HttpServerRequestWrapper(request, router.getAllowForward());
+
+    if (request.path().length() == 0) {
+      // HTTP paths must start with a '/'
+      fail(400);
+    } else if (request.path().charAt(0) != '/') {
+      // For compatiblity we return `Not Found` when a path does not start with `/`
       fail(404);
     }
+  }
+
+  private String ensureNotNull(String string){
+    return string == null ? "" : string;
+  }
+
+  private void fillParsedHeaders(HttpServerRequest request) {
+    String accept = request.getHeader(HttpHeaders.ACCEPT);
+    String acceptCharset = request.getHeader (HttpHeaders.ACCEPT_CHARSET);
+    String acceptEncoding = request.getHeader(HttpHeaders.ACCEPT_ENCODING);
+    String acceptLanguage = request.getHeader(HttpHeaders.ACCEPT_LANGUAGE);
+    String contentType = ensureNotNull(request.getHeader(HttpHeaders.CONTENT_TYPE));
+
+    parsedHeaders = new ParsableHeaderValuesContainer(
+        HeaderParser.sort(HeaderParser.convertToParsedHeaderValues(accept, ParsableMIMEValue::new)),
+        HeaderParser.sort(HeaderParser.convertToParsedHeaderValues(acceptCharset, ParsableHeaderValue::new)),
+        HeaderParser.sort(HeaderParser.convertToParsedHeaderValues(acceptEncoding, ParsableHeaderValue::new)),
+        HeaderParser.sort(HeaderParser.convertToParsedHeaderValues(acceptLanguage, ParsableLanguageValue::new)),
+        new ParsableMIMEValue(contentType)
+    );
+
   }
 
   @Override
@@ -104,14 +137,21 @@ public class RoutingContextImpl extends RoutingContextImplBase {
       // Send back FAILURE
       unhandledFailure(statusCode, failure, router);
     } else {
-      // Send back default 404
-      response().setStatusCode(404);
-      if (request().method() == HttpMethod.HEAD) {
-        // HEAD responses don't have a body
-        response().end();
-      } else {
-        response().end(DEFAULT_404);
-      }
+      Handler<RoutingContext> handler = router.getErrorHandlerByStatusCode(this.matchFailure);
+      this.statusCode = this.matchFailure;
+      if (handler == null) { // Default 404 handling
+        // Send back empty default response with status code
+        this.response().setStatusCode(matchFailure);
+        if (this.request().method() != HttpMethod.HEAD && matchFailure == 404) {
+          // If it's a 404 let's send a body too
+          this.response()
+            .putHeader(HttpHeaderNames.CONTENT_TYPE, "text/html; charset=utf-8")
+            .end(DEFAULT_404);
+        } else {
+          this.response().end();
+        }
+      } else
+        handler.handle(this);
     }
   }
 
@@ -123,7 +163,17 @@ public class RoutingContextImpl extends RoutingContextImplBase {
 
   @Override
   public void fail(Throwable t) {
-    this.failure = t == null ? new NullPointerException() : t;
+    if (t instanceof HttpStatusException) {
+      this.fail(((HttpStatusException) t).getStatusCode(), t);
+    } else {
+      this.fail(500, t);
+    }
+  }
+
+  @Override
+  public void fail(int statusCode, Throwable throwable) {
+    this.statusCode = statusCode;
+    this.failure = throwable == null ? new NullPointerException() : throwable;
     doFail();
   }
 
@@ -146,47 +196,78 @@ public class RoutingContextImpl extends RoutingContextImplBase {
   }
 
   @Override
+  @SuppressWarnings("unchecked")
+  public <T> T remove(String key) {
+    Object obj = getData().remove(key);
+    return (T)obj;
+  }
+
+  @Override
   public Map<String, Object> data() {
     return getData();
   }
 
   @Override
-  public String normalisedPath() {
-    if (normalisedPath == null) {
-      normalisedPath = Utils.normalisePath(request.path());
+  public String normalizedPath() {
+    if (normalizedPath == null) {
+      String path = request.path();
+      if (path == null) {
+        normalizedPath = "/";
+      } else {
+        normalizedPath = HttpUtils.normalizePath(path);
+      }
     }
-    return normalisedPath;
+    return normalizedPath;
   }
 
   @Override
   public Cookie getCookie(String name) {
-    return cookiesMap().get(name);
+    return request.getCookie(name);
   }
 
   @Override
-  public RoutingContext addCookie(Cookie cookie) {
-    cookiesMap().put(cookie.getName(), cookie);
+  public RoutingContext addCookie(io.vertx.core.http.Cookie cookie) {
+    request.response().addCookie(cookie);
     return this;
   }
 
   @Override
-  public Cookie removeCookie(String name) {
-    return cookiesMap().remove(name);
+  public Cookie removeCookie(String name, boolean invalidate) {
+    return request.response().removeCookie(name, invalidate);
   }
 
   @Override
   public int cookieCount() {
-    return cookiesMap().size();
+    return request.cookieCount();
   }
 
   @Override
-  public Set<Cookie> cookies() {
-    return new HashSet<>(cookiesMap().values());
+  public Map<String, Cookie> cookieMap() {
+    return request.cookieMap();
   }
 
   @Override
   public String getBodyAsString() {
-    return body != null ? body.toString() : null;
+    if (body != null) {
+      ParsableHeaderValuesContainer parsedHeaders = parsedHeaders();
+      if (parsedHeaders != null) {
+        ParsableMIMEValue contentType = parsedHeaders.contentType();
+        if (contentType != null) {
+          String charset = contentType.parameter("charset");
+          if (charset != null) {
+            return body.toString(charset);
+          }
+        }
+      }
+      return body.toString();
+    } else {
+      if (!seenHandler(BODY_HANDLER)) {
+        if (LOG.isWarnEnabled()) {
+          LOG.warn("BodyHandler in not enabled on this route: RoutingContext.getBodyAsString(...) in always be NULL");
+        }
+      }
+    }
+    return null;
   }
 
   @Override
@@ -195,13 +276,37 @@ public class RoutingContextImpl extends RoutingContextImplBase {
   }
 
   @Override
-  public JsonObject getBodyAsJson() {
-    return body != null ? new JsonObject(body.toString()) : null;
+  public JsonObject getBodyAsJson(int maxAllowedLength) {
+    if (body != null) {
+      if (maxAllowedLength >= 0 && body.length() > maxAllowedLength) {
+        throw new IllegalStateException("RoutingContext body size exceeds the allowed limit");
+      }
+      return BodyCodecImpl.JSON_OBJECT_DECODER.apply(body);
+    } else {
+      if (!seenHandler(BODY_HANDLER)) {
+        if (LOG.isWarnEnabled()) {
+          LOG.warn("BodyHandler in not enabled on this route: RoutingContext.getBodyAsJson() in always be NULL");
+        }
+      }
+    }
+    return null;
   }
 
   @Override
-  public JsonArray getBodyAsJsonArray() {
-    return body != null ? new JsonArray(body.toString()) : null;
+  public JsonArray getBodyAsJsonArray(int maxAllowedLength) {
+    if (body != null) {
+      if (maxAllowedLength >= 0 && body.length() > maxAllowedLength) {
+        throw new IllegalStateException("RoutingContext body size exceeds the allowed limit");
+      }
+      return BodyCodecImpl.JSON_ARRAY_DECODER.apply(body);
+    } else {
+      if (!seenHandler(BODY_HANDLER)) {
+        if (LOG.isWarnEnabled()) {
+          LOG.warn("BodyHandler in not enabled on this route: RoutingContext.getBodyAsJsonArray(...) in always be NULL");
+        }
+      }
+    }
+    return null;
   }
 
   @Override
@@ -226,7 +331,13 @@ public class RoutingContextImpl extends RoutingContextImplBase {
 
   @Override
   public Session session() {
+    this.isSessionAccessed = true;
     return session;
+  }
+
+  @Override
+  public boolean isSessionAccessed(){
+    return isSessionAccessed;
   }
 
   @Override
@@ -255,6 +366,14 @@ public class RoutingContextImpl extends RoutingContextImplBase {
   }
 
   @Override
+  public ParsableHeaderValuesContainer parsedHeaders() {
+    if (parsedHeaders == null) {
+      fillParsedHeaders(request);
+    }
+    return parsedHeaders;
+  }
+
+  @Override
   public int addHeadersEndHandler(Handler<Void> handler) {
     int seq = nextHandlerSeq();
     getHeadersEndHandlers().put(seq, handler);
@@ -279,48 +398,40 @@ public class RoutingContextImpl extends RoutingContextImplBase {
   }
 
   @Override
-  public void reroute(HttpMethod method, String path) {
-    ((HttpServerRequestWrapper) request).setMethod(method);
-    ((HttpServerRequestWrapper) request).setPath(path);
-    request.params().clear();
-    // we need to reset the normalized path
-    normalisedPath = null;
-    restart();
+  public int addEndHandler(Handler<AsyncResult<Void>> handler) {
+    int seq = nextHandlerSeq();
+    getEndHandlers().put(seq, handler);
+    return seq;
   }
 
   @Override
-  public List<Locale> acceptableLocales() {
-    String languages = request.getHeader("Accept-Language");
-    if (languages != null) {
-      List<String> acceptLanguages = Utils.getSortedAcceptableMimeTypes(languages);
+  public boolean removeEndHandler(int handlerID) {
+    return getEndHandlers().remove(handlerID) != null;
+  }
 
-      final List<Locale> locales = new ArrayList<>(acceptLanguages.size());
-
-      for (String lang : acceptLanguages) {
-        int idx = lang.indexOf(';');
-
-        if (idx != -1) {
-          lang = lang.substring(0, idx).trim();
-        }
-
-        String[] parts = lang.split("_|-");
-        switch (parts.length) {
-          case 3:
-            locales.add(Locale.create(parts[0], parts[1], parts[2]));
-            break;
-          case 2:
-            locales.add(Locale.create(parts[0], parts[1]));
-            break;
-          case 1:
-            locales.add(Locale.create(parts[0]));
-            break;
-        }
-      }
-
-      return locales;
+  @Override
+  public void reroute(HttpMethod method, String path) {
+    if (path.charAt(0) != '/') {
+      throw new IllegalArgumentException("path must start with '/'");
+    }
+    // change the method and path of the request
+    ((HttpServerRequestWrapper) request).changeTo(method, path);
+    // we need to reset the normalized path
+    normalizedPath = null;
+    // we also need to reset any previous status
+    statusCode = -1;
+    // we need to reset any response headers
+    response().headers().clear();
+    // reset the end handlers
+    if (headersEndHandlers != null) {
+      headersEndHandlers.clear();
+    }
+    if (bodyEndHandlers != null) {
+      bodyEndHandlers.clear();
     }
 
-    return Collections.emptyList();
+    failure = null;
+    restart();
   }
 
   @Override
@@ -331,6 +442,33 @@ public class RoutingContextImpl extends RoutingContextImplBase {
   @Override
   public @Nullable String pathParam(String name) {
     return getPathParams().get(name);
+  }
+
+  @Override
+  public MultiMap queryParams() {
+    return getQueryParams();
+  }
+
+  @Override
+  public @Nullable List<String> queryParam(String query) {
+    return getQueryParams().getAll(query);
+  }
+
+  private MultiMap getQueryParams() {
+    // Check if query params are already parsed
+    if (queryParams == null) {
+      try {
+        queryParams = MultiMap.caseInsensitiveMultiMap();
+
+        // Decode query parameters and put inside context.queryParams
+        Map<String, List<String>> decodedParams = new QueryStringDecoder(request.uri()).parameters();
+        for (Map.Entry<String, List<String>> entry : decodedParams.entrySet())
+          queryParams.add(entry.getKey(), entry.getValue());
+      } catch (IllegalArgumentException e) {
+        throw new HttpStatusException(400, "Error while decoding query params", e);
+      }
+    }
+    return queryParams;
   }
 
   private Map<String, String> getPathParams() {
@@ -358,11 +496,39 @@ public class RoutingContextImpl extends RoutingContextImplBase {
     return bodyEndHandlers;
   }
 
-  private Map<String, Cookie> cookiesMap() {
-    if (cookies == null) {
-      cookies = new HashMap<>();
+  private Map<Integer, Handler<AsyncResult<Void>>> getEndHandlers() {
+    if (endHandlers == null) {
+      // order is important we we should traverse backwards
+      endHandlers = new TreeMap<>(Collections.reverseOrder());
+
+      final Handler<Void> endHandler = v -> {
+        if (!endHandlerCalled) {
+          endHandlerCalled = true;
+          endHandlers.values().forEach(handler -> handler.handle(Future.succeededFuture()));
+        }
+      };
+
+      final Handler<Throwable> exceptionHandler = cause -> {
+        if (!endHandlerCalled) {
+          endHandlerCalled = true;
+          endHandlers.values().forEach(handler -> handler.handle(Future.failedFuture(cause)));
+        }
+      };
+
+      final Handler<Void> closeHandler = cause -> {
+        if (!endHandlerCalled) {
+          endHandlerCalled = true;
+          endHandlers.values().forEach(handler -> handler.handle(Future.failedFuture("Connection closed")));
+        }
+      };
+
+      response()
+        .endHandler(endHandler)
+        .exceptionHandler(exceptionHandler)
+        .closeHandler(closeHandler);
     }
-    return cookies;
+
+    return endHandlers;
   }
 
   private Set<FileUpload> getFileUploads() {
@@ -374,6 +540,7 @@ public class RoutingContextImpl extends RoutingContextImplBase {
 
   private void doFail() {
     this.iter = router.iterator();
+    currentRoute = null;
     next();
   }
 

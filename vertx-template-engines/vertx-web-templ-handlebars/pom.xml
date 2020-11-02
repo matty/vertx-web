@@ -7,7 +7,7 @@
   <parent>
     <groupId>io.vertx</groupId>
     <artifactId>vertx-template-engines</artifactId>
-    <version>3.3.0-SNAPSHOT</version>
+    <version>4.0.0-SNAPSHOT</version>
   </parent>
 
   <artifactId>vertx-web-templ-handlebars</artifactId>
@@ -16,18 +16,27 @@
     <dependency>
       <groupId>com.github.jknack</groupId>
       <artifactId>handlebars</artifactId>
-      <version>4.0.3</version>
+      <version>4.2.0</version>
+      <exclusions>
+        <exclusion>
+          <groupId>org.slf4j</groupId>
+          <artifactId>slf4j-api</artifactId>
+        </exclusion>
+      </exclusions>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>1.7.21</version>
     </dependency>
     <dependency>
       <groupId>io.vertx</groupId>
-      <artifactId>vertx-web</artifactId>
+      <artifactId>vertx-web-common</artifactId>
       <version>${project.version}</version>
     </dependency>
     <dependency>
       <groupId>io.vertx</groupId>
-      <artifactId>vertx-web</artifactId>
-      <type>test-jar</type>
-      <version>${project.version}</version>
+      <artifactId>vertx-unit</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -51,9 +60,6 @@
               <artifactSet>
                 <includes>
                   <include>*:handlebars</include>
-                  <include>org.apache.commons:commons-lang3</include>
-                  <include>org.antlr:*</include>
-                  <!-- run in no-rhino mode (do not include rhino) -->
                 </includes>
               </artifactSet>
             </configuration>

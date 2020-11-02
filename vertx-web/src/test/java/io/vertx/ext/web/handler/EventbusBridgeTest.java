@@ -18,16 +18,21 @@ package io.vertx.ext.web.handler;
 import io.vertx.core.eventbus.DeliveryOptions;
 import io.vertx.core.eventbus.Message;
 import io.vertx.core.eventbus.MessageConsumer;
+import io.vertx.core.http.HttpServerRequest;
+import io.vertx.core.http.WebSocketBase;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
-import io.vertx.ext.auth.AuthProvider;
-import io.vertx.ext.auth.shiro.ShiroAuth;
-import io.vertx.ext.auth.shiro.ShiroAuthRealmType;
+import io.vertx.ext.auth.authentication.AuthenticationProvider;
+import io.vertx.ext.auth.authentication.UsernamePasswordCredentials;
+import io.vertx.ext.auth.properties.PropertyFileAuthentication;
+import io.vertx.ext.auth.properties.PropertyFileAuthorization;
+import io.vertx.ext.bridge.BridgeEventType;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.WebTestBase;
 import io.vertx.ext.web.handler.sockjs.*;
 import io.vertx.ext.web.sstore.LocalSessionStore;
 import io.vertx.ext.web.sstore.SessionStore;
+import io.vertx.ext.bridge.PermittedOptions;
 import io.vertx.test.core.TestUtils;
 import org.junit.Test;
 
@@ -41,9 +46,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class EventbusBridgeTest extends WebTestBase {
 
   protected SockJSHandler sockJSHandler;
-  protected BridgeOptions defaultOptions = new BridgeOptions();
-  protected BridgeOptions allAccessOptions =
-    new BridgeOptions().addInboundPermitted(new PermittedOptions()).addOutboundPermitted(new PermittedOptions());
+  protected SockJSBridgeOptions defaultOptions = new SockJSBridgeOptions();
+  protected SockJSBridgeOptions allAccessOptions =
+    new SockJSBridgeOptions().addInboundPermitted(new PermittedOptions()).addOutboundPermitted(new PermittedOptions());
 
   protected String websocketURI = "/eventbus/websocket";
   protected String addr = "someaddress";
@@ -61,7 +66,7 @@ public class EventbusBridgeTest extends WebTestBase {
     sockJSHandler.bridge(allAccessOptions, be -> {
       if (be.type() == BridgeEventType.SOCKET_CREATED) {
         assertNotNull(be.socket());
-        assertNull(be.rawMessage());
+        assertNull(be.getRawMessage());
         be.complete(true);
         testComplete();
       } else {
@@ -86,11 +91,11 @@ public class EventbusBridgeTest extends WebTestBase {
       }
     });
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
       JsonObject msg = new JsonObject().put("type", "send").put("address", addr).put("body", "foobar");
       ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(msg.encode(), true));
       ws.closeHandler(v -> latch.countDown());
-    });
+    }));
 
     awaitLatch(latch);
   }
@@ -108,7 +113,7 @@ public class EventbusBridgeTest extends WebTestBase {
         be.complete(true);
       }
     });
-    client.websocket(websocketURI, ws -> ws.close());
+    client.webSocket(websocketURI, onSuccess(WebSocketBase::close));
     await();
   }
 
@@ -169,6 +174,20 @@ public class EventbusBridgeTest extends WebTestBase {
   }
 
   @Test
+  public void testHookSendMissingAddress() throws Exception {
+    sockJSHandler.bridge(allAccessOptions, be -> {
+      if (be.type() == BridgeEventType.SEND) {
+        be.getRawMessage().remove("address");
+        testComplete();
+      }
+      be.complete(true);
+    });
+    testError(new JsonObject().put("type", "send").put("address", addr).put("body", "foobar"),
+      "missing_address");
+    await();
+  }
+
+  @Test
   public void testHookPublish() throws Exception {
 
     sockJSHandler.bridge(allAccessOptions, be -> {
@@ -225,6 +244,20 @@ public class EventbusBridgeTest extends WebTestBase {
   }
 
   @Test
+  public void testHookPublishMissingAddress() throws Exception {
+    sockJSHandler.bridge(allAccessOptions, be -> {
+      if (be.type() == BridgeEventType.PUBLISH) {
+        be.getRawMessage().remove("address");
+        testComplete();
+      }
+      be.complete(true);
+    });
+    testError(new JsonObject().put("type", "publish").put("address", addr).put("body", "foobar"),
+      "missing_address");
+    await();
+  }
+
+  @Test
   public void testHookRegister() throws Exception {
 
     sockJSHandler.bridge(allAccessOptions, be -> {
@@ -256,6 +289,72 @@ public class EventbusBridgeTest extends WebTestBase {
     testError(new JsonObject().put("type", "register").put("address", addr),
       "rejected");
     await();
+  }
+
+  @Test
+  public void testHookRegisterMissingAddress() throws Exception {
+    sockJSHandler.bridge(allAccessOptions, be -> {
+      if (be.type() == BridgeEventType.REGISTER) {
+        be.getRawMessage().remove("address");
+        testComplete();
+      }
+      be.complete(true);
+    });
+    testError(new JsonObject().put("type", "register").put("address", addr).put("body", "foobar"),
+      "missing_address");
+    await();
+  }
+
+  @Test
+  public void testHookRegistered() throws Exception {
+    CountDownLatch registerLatch = new CountDownLatch(1);
+    CountDownLatch registeredLatch = new CountDownLatch(1);
+    CountDownLatch requestLatch = new CountDownLatch(1);
+
+    final String payload = "hello slinkydeveloper!";
+
+    // 1. Check if REGISTER hook is called
+    // 2. Check if REGISTERED hook is called
+    // 3. Try to send a message while managing REGISTERED event
+    // 4. Check if client receives the message
+
+    sockJSHandler.bridge(allAccessOptions, be -> {
+      if (be.type() == BridgeEventType.REGISTER) {
+        assertNotNull(be.socket());
+        JsonObject raw = be.getRawMessage();
+        assertEquals(addr, raw.getString("address"));
+        registerLatch.countDown();
+      } else if (be.type() == BridgeEventType.REGISTERED) {
+        assertNotNull(be.socket());
+        JsonObject raw = be.getRawMessage();
+        assertEquals(addr, raw.getString("address"));
+
+        // The client should be able to receive this message
+        vertx.eventBus().send(addr, payload);
+
+        registeredLatch.countDown();
+      }
+      be.complete(true);
+    });
+
+    client.webSocket(websocketURI, onSuccess(ws -> {
+      // Register
+      JsonObject msg = new JsonObject().put("type", "register").put("address", addr);
+      ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(msg.encode(), true));
+
+      ws.handler(buff -> {
+        String str = buff.toString();
+        JsonObject received = new JsonObject(str);
+        assertEquals("rec", received.getString("type"));
+        assertEquals(payload, received.getString("body"));
+        ws.closeHandler(v -> requestLatch.countDown());
+        ws.close();
+      });
+    }));
+
+    awaitLatch(registerLatch);
+    awaitLatch(registeredLatch);
+    awaitLatch(requestLatch);
   }
 
   @Test
@@ -323,6 +422,20 @@ public class EventbusBridgeTest extends WebTestBase {
     });
     testError(new JsonObject().put("type", "unregister").put("address", addr),
       "rejected");
+    await();
+  }
+
+  @Test
+  public void testHookUnregisterMissingAddress() throws Exception {
+    sockJSHandler.bridge(allAccessOptions, be -> {
+      if (be.type() == BridgeEventType.UNREGISTER) {
+        be.getRawMessage().remove("address");
+        testComplete();
+      }
+      be.complete(true);
+    });
+    testError(new JsonObject().put("type", "unregister").put("address", addr).put("body", "foobar"),
+      "missing_address");
     await();
   }
 
@@ -654,7 +767,7 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       MessageConsumer<Object> consumer = vertx.eventBus().consumer(addr);
 
@@ -680,7 +793,7 @@ public class EventbusBridgeTest extends WebTestBase {
         ws.close();
       });
 
-    });
+    }));
 
     awaitLatch(latch);
   }
@@ -693,14 +806,14 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       MessageConsumer<Object> consumer = vertx.eventBus().consumer(addr);
 
       consumer.handler(msg -> {
         Object receivedBody = msg.body();
         assertEquals("foobar", receivedBody);
-        msg.reply("barfoo",new DeliveryOptions().addHeader("headfoo", "headbar").addHeader("multi", "m1").addHeader("multi", "m2") );
+        msg.reply("barfoo", new DeliveryOptions().addHeader("headfoo", "headbar").addHeader("explode", "m1").addHeader("explode", "m2"));
         consumer.unregister();
       });
 
@@ -718,13 +831,13 @@ public class EventbusBridgeTest extends WebTestBase {
         JsonObject headers = received.getJsonObject("headers");
         assertNotNull(headers);
         assertEquals("headbar", headers.getString("headfoo"));
-        assertTrue(headers.getJsonArray("multi").contains("m1"));
-        assertTrue(headers.getJsonArray("multi").contains("m2"));
+        assertTrue(headers.getJsonArray("explode").contains("m1"));
+        assertTrue(headers.getJsonArray("explode").contains("m2"));
         ws.closeHandler(v -> latch.countDown());
         ws.close();
       });
 
-    });
+    }));
 
     awaitLatch(latch);
   }
@@ -737,7 +850,7 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       JsonObject reg = new JsonObject().put("type", "register").put("address", addr);
       ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(reg.encode(), true));
@@ -753,17 +866,15 @@ public class EventbusBridgeTest extends WebTestBase {
         ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(reply.encode(), true));
       });
 
-      vertx.setTimer(500, tid -> {
-        vertx.eventBus().send(addr, "foobar", res -> {
-          if (res.succeeded()) {
-            assertEquals("barfoo", res.result().body());
-            ws.closeHandler(v2 -> latch.countDown());
-            ws.close();
-          }
-        });
-      });
+      vertx.setTimer(500, tid -> vertx.eventBus().request(addr, "foobar", res -> {
+        if (res.succeeded()) {
+          assertEquals("barfoo", res.result().body());
+          ws.closeHandler(v2 -> latch.countDown());
+          ws.close();
+        }
+      }));
 
-    });
+    }));
 
     awaitLatch(latch);
   }
@@ -775,7 +886,7 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       MessageConsumer<Object> consumer = vertx.eventBus().consumer(addr);
 
@@ -803,7 +914,7 @@ public class EventbusBridgeTest extends WebTestBase {
         ws.close();
       });
 
-    });
+    }));
 
     awaitLatch(latch);
   }
@@ -815,14 +926,14 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       MessageConsumer<Object> consumer = vertx.eventBus().consumer(addr);
 
       consumer.handler(msg -> {
         Object receivedBody = msg.body();
         assertEquals("one", receivedBody);
-        msg.reply("two", rep -> {
+        msg.replyAndRequest("two", rep -> {
           assertTrue(rep.succeeded());
           Object repReceivedBody = rep.result().body();
           assertEquals("three", repReceivedBody);
@@ -859,7 +970,7 @@ public class EventbusBridgeTest extends WebTestBase {
         });
       });
 
-    });
+    }));
 
     awaitLatch(latch);
   }
@@ -885,9 +996,9 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    sockJSHandler.bridge(new BridgeOptions(allAccessOptions).setMaxHandlersPerSocket(maxHandlers));
+    sockJSHandler.bridge(new SockJSBridgeOptions(allAccessOptions).setMaxHandlersPerSocket(maxHandlers));
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       for (int i = 0; i < maxHandlers + 1; i++) {
         JsonObject msg = new JsonObject().put("type", "register").put("address", addr);
@@ -918,7 +1029,7 @@ public class EventbusBridgeTest extends WebTestBase {
       JsonObject msg = new JsonObject().put("type", "publish").put("address", addr).put("body", "foobar");
       ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(msg.encode(), true));
 
-    });
+    }));
 
     awaitLatch(latch);
 
@@ -929,9 +1040,9 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    sockJSHandler.bridge(new BridgeOptions(allAccessOptions).setMaxAddressLength(10));
+    sockJSHandler.bridge(new SockJSBridgeOptions(allAccessOptions).setMaxAddressLength(10));
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       JsonObject msg = new JsonObject().put("type", "register").put("address", "someaddressyqgyuqwdyudyug");
       ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(msg.encode(), true));
@@ -944,7 +1055,7 @@ public class EventbusBridgeTest extends WebTestBase {
         latch.countDown();
       });
 
-    });
+    }));
 
     awaitLatch(latch);
   }
@@ -957,13 +1068,11 @@ public class EventbusBridgeTest extends WebTestBase {
 
   @Test
   public void testSendRequiresAuthorityHasAuthority() throws Exception {
-    sockJSHandler.bridge(defaultOptions.addInboundPermitted(new PermittedOptions().setAddress(addr).setRequiredAuthority("bang_sticks")));
+    sockJSHandler.bridge(PropertyFileAuthorization.create(vertx, "login/loginusers.properties"), defaultOptions.addInboundPermitted(new PermittedOptions().setAddress(addr).setRequiredAuthority("bang_sticks")), null);
     router.clear();
-    router.route().handler(CookieHandler.create());
     SessionStore store = LocalSessionStore.create(vertx);
     router.route().handler(SessionHandler.create(store));
-    JsonObject authConfig = new JsonObject().put("properties_path", "classpath:login/loginusers.properties");
-    AuthProvider authProvider = ShiroAuth.create(vertx, ShiroAuthRealmType.PROPERTIES, authConfig);
+    AuthenticationProvider authProvider = PropertyFileAuthentication.create(vertx, "login/loginusers.properties");
     addLoginHandler(router, authProvider);
     router.route("/eventbus/*").handler(sockJSHandler);
     testSend("foo");
@@ -973,22 +1082,23 @@ public class EventbusBridgeTest extends WebTestBase {
   public void testSendRequiresAuthorityHasnotAuthority() throws Exception {
     sockJSHandler.bridge(defaultOptions.addInboundPermitted(new PermittedOptions().setAddress(addr).setRequiredAuthority("pick_nose")));
     router.clear();
-    router.route().handler(CookieHandler.create());
     SessionStore store = LocalSessionStore.create(vertx);
     router.route().handler(SessionHandler.create(store));
-    JsonObject authConfig = new JsonObject().put("properties_path", "classpath:login/loginusers.properties");
-    AuthProvider authProvider = ShiroAuth.create(vertx, ShiroAuthRealmType.PROPERTIES, authConfig);
+    AuthenticationProvider authProvider = PropertyFileAuthentication.create(vertx, "login/loginusers.properties");
     addLoginHandler(router, authProvider);
     router.route("/eventbus/*").handler(sockJSHandler);
     testError(new JsonObject().put("type", "send").put("address", addr).put("body", "foo"), "access_denied");
   }
 
-  private void addLoginHandler(Router router, AuthProvider authProvider) {
+  private void addLoginHandler(Router router, AuthenticationProvider authProvider) {
     router.route("/eventbus/*").handler(rc -> {
       // we need to be logged in
       if (rc.user() == null) {
-        JsonObject authInfo = new JsonObject().put("username", "tim").put("password", "delicious:sausages");
+        UsernamePasswordCredentials authInfo = new UsernamePasswordCredentials("tim", "delicious:sausages");
+        HttpServerRequest request = rc.request();
+        request.pause();
         authProvider.authenticate(authInfo, res -> {
+          request.resume();
           if (res.succeeded()) {
             rc.setUser(res.result());
             rc.next();
@@ -1012,7 +1122,7 @@ public class EventbusBridgeTest extends WebTestBase {
     sockJSHandler.bridge(allAccessOptions.setPingTimeout(1000));
     CountDownLatch latch = new CountDownLatch(1);
     long start = System.currentTimeMillis();
-    client.websocket(websocketURI, ws -> ws.closeHandler(v -> latch.countDown()));
+    client.webSocket(websocketURI, onSuccess(ws -> ws.closeHandler(v -> latch.countDown())));
     awaitLatch(latch);
     long dur = System.currentTimeMillis() - start;
     assertTrue(dur > 1000 && dur < 3000);
@@ -1078,7 +1188,7 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(msg, true));
 
@@ -1089,7 +1199,7 @@ public class EventbusBridgeTest extends WebTestBase {
         assertEquals(expectedErr, received.getString("body"));
         latch.countDown();
       });
-    });
+    }));
 
     awaitLatch(latch);
   }
@@ -1106,7 +1216,7 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       MessageConsumer<Object> consumer = vertx.eventBus().consumer(address);
 
@@ -1122,7 +1232,7 @@ public class EventbusBridgeTest extends WebTestBase {
       JsonObject msg = new JsonObject().put("type", "send").put("address", address).put("body", body);
       ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(msg.encode(), true));
 
-    });
+    }));
 
     awaitLatch(latch);
 
@@ -1144,7 +1254,7 @@ public class EventbusBridgeTest extends WebTestBase {
   private void testPublish(String address, Object body, boolean headers) throws Exception {
     CountDownLatch latch = new CountDownLatch(2);
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       vertx.eventBus().consumer(address, msg -> {
         Object receivedBody = msg.body();
@@ -1167,7 +1277,7 @@ public class EventbusBridgeTest extends WebTestBase {
       JsonObject msg = new JsonObject().put("type", "publish").put("address", address).put("body", body);
       ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(msg.encode(), true));
 
-    });
+    }));
 
     awaitLatch(latch);
   }
@@ -1178,7 +1288,7 @@ public class EventbusBridgeTest extends WebTestBase {
 
   private void testReceive(String address, Object body) throws Exception {
     CountDownLatch latch = new CountDownLatch(1);
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       // Register
       JsonObject msg = new JsonObject().put("type", "register").put("address", address);
@@ -1190,36 +1300,32 @@ public class EventbusBridgeTest extends WebTestBase {
         assertEquals("rec", received.getString("type"));
         Object rec = received.getValue("body");
         assertEquals(body, rec);
-        ws.closeHandler(v -> {
-          latch.countDown();
-        });
+        ws.closeHandler(v -> latch.countDown());
         ws.close();
       });
 
       // Wait a bit to allow the handler to be setup on the server, then send message from eventbus
       vertx.setTimer(200, tid -> vertx.eventBus().send(address, body));
-    });
+    }));
     awaitLatch(latch);
   }
 
   private void testReceiveFail(String address, Object body) throws Exception {
     CountDownLatch latch = new CountDownLatch(1);
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       // Register
       JsonObject msg = new JsonObject().put("type", "register").put("address", address);
       ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(msg.encode(), true));
 
-      ws.handler(buff -> {
-        fail("Shouldn't receive anything");
-      });
+      ws.handler(buff -> fail("Shouldn't receive anything"));
 
       // Wait a bit to allow the handler to be setup on the server, then send message from eventbus
       vertx.setTimer(200, tid -> {
         vertx.eventBus().send(address, body);
         vertx.setTimer(200, tid2 -> latch.countDown());
       });
-    });
+    }));
     awaitLatch(latch);
   }
 
@@ -1227,7 +1333,7 @@ public class EventbusBridgeTest extends WebTestBase {
 
     CountDownLatch latch = new CountDownLatch(1);
 
-    client.websocket(websocketURI, ws -> {
+    client.webSocket(websocketURI, onSuccess(ws -> {
 
       // Register
       JsonObject msg = new JsonObject().put("type", "register").put("address", address);
@@ -1256,7 +1362,7 @@ public class EventbusBridgeTest extends WebTestBase {
       msg = new JsonObject().put("type", "send").put("address", address).put("body", "foobar");
       ws.writeFrame(io.vertx.core.http.WebSocketFrame.textFrame(msg.encode(), true));
 
-    });
+    }));
 
     awaitLatch(latch);
   }

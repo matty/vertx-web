@@ -39,6 +39,11 @@ import java.util.Map;
 public interface Session {
 
   /**
+   * @return The new unique ID of the session.
+   */
+  Session regenerateId();
+
+  /**
    * @return The unique ID of the session. This is generated using a random secure UUID.
    */
   String id();
@@ -72,8 +77,13 @@ public interface Session {
   /**
    * @return the session data as a map
    */
-  @GenIgnore
+  @GenIgnore(GenIgnore.PERMITTED_TYPE)
   Map<String, Object> data();
+
+  /**
+   * @return true if the session has data
+   */
+  boolean isEmpty();
 
   /**
    * @return the time the session was last accessed
@@ -91,6 +101,16 @@ public interface Session {
   boolean isDestroyed();
 
   /**
+   * @return has the session been renewed?
+   */
+  boolean isRegenerated();
+
+  /**
+   * @return old ID if renewed
+   */
+  String oldId();
+
+  /**
    * @return the amount of time in ms, after which the session will expire, if not accessed.
    */
   long timeout();
@@ -100,4 +120,12 @@ public interface Session {
    */
   void setAccessed();
 
+  /**
+   * The short representation of the session to be added to the session cookie. By default is the session id.
+   *
+   * @return short representation string.
+   */
+  default String value() {
+    return id();
+  }
 }

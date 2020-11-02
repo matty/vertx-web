@@ -20,26 +20,46 @@ import io.vertx.core.AsyncResult;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
+import io.vertx.core.json.JsonObject;
 import io.vertx.core.shareddata.AsyncMap;
+import io.vertx.ext.auth.VertxContextPRNG;
 import io.vertx.ext.web.Session;
+import io.vertx.ext.web.sstore.AbstractSession;
 import io.vertx.ext.web.sstore.ClusteredSessionStore;
+import io.vertx.ext.web.sstore.SessionStore;
 
 /**
  * @author <a href="http://tfox.org">Tim Fox</a>
  */
-public class ClusteredSessionStoreImpl implements ClusteredSessionStore {
+public class ClusteredSessionStoreImpl implements SessionStore, ClusteredSessionStore {
 
-  private final Vertx vertx;
-  private final String sessionMapName;
-  private final long retryTimeout;
+  /**
+   * The default name used for the session map
+   */
+  private static final String DEFAULT_SESSION_MAP_NAME = "vertx-web.sessions";
+
+  /**
+   * Default retry time out, in ms, for a session not found in this store.
+   */
+  private static final long DEFAULT_RETRY_TIMEOUT = 5 * 1000; // 5 seconds
+
+
+  private Vertx vertx;
+  private VertxContextPRNG random;
+  private String sessionMapName;
+  private long retryTimeout;
 
   // Clustered Map
   private volatile AsyncMap<String, Session> sessionMap;
 
-  public ClusteredSessionStoreImpl(Vertx vertx, String sessionMapName, long retryTimeout) {
+  @Override
+  public SessionStore init(Vertx vertx, JsonObject options) {
     this.vertx = vertx;
-    this.sessionMapName = sessionMapName;
-    this.retryTimeout = retryTimeout;
+    this.sessionMapName = options.getString("mapName", DEFAULT_SESSION_MAP_NAME);
+    this.retryTimeout = options.getLong("retryTimeout", DEFAULT_RETRY_TIMEOUT);
+    this.random = VertxContextPRNG.current(vertx);
+
+    return this;
   }
 
   @Override
@@ -49,7 +69,12 @@ public class ClusteredSessionStoreImpl implements ClusteredSessionStore {
 
   @Override
   public Session createSession(long timeout) {
-    return new SessionImpl(timeout);
+    return new SharedDataSessionImpl(random, timeout, DEFAULT_SESSIONID_LENGTH);
+  }
+
+  @Override
+  public Session createSession(long timeout, int length) {
+    return new SharedDataSessionImpl(random, timeout, length);
   }
 
   @Override
@@ -58,6 +83,10 @@ public class ClusteredSessionStoreImpl implements ClusteredSessionStore {
       if (res.succeeded()) {
         res.result().get(id, res2 -> {
           if (res2.succeeded()) {
+            AbstractSession session = (AbstractSession) res2.result();
+            if (session != null) {
+              session.setPRNG(random);
+            }
             resultHandler.handle(Future.succeededFuture(res2.result()));
           } else {
             resultHandler.handle(Future.failedFuture(res2.cause()));
@@ -70,12 +99,12 @@ public class ClusteredSessionStoreImpl implements ClusteredSessionStore {
   }
 
   @Override
-  public void delete(String id, Handler<AsyncResult<Boolean>> resultHandler) {
+  public void delete(String id, Handler<AsyncResult<Void>> resultHandler) {
     getMap(res -> {
       if (res.succeeded()) {
         res.result().remove(id, res2 -> {
           if (res2.succeeded()) {
-            resultHandler.handle(Future.succeededFuture(res2.result() != null));
+            resultHandler.handle(Future.succeededFuture());
           } else {
             resultHandler.handle(Future.failedFuture(res2.cause()));
           }
@@ -87,15 +116,39 @@ public class ClusteredSessionStoreImpl implements ClusteredSessionStore {
   }
 
   @Override
-  public void put(Session session, Handler<AsyncResult<Boolean>> resultHandler) {
+  public void put(Session session, Handler<AsyncResult<Void>> resultHandler) {
     getMap(res -> {
       if (res.succeeded()) {
-        res.result().put(session.id(), session, session.timeout(), res2 -> {
-          if (res2.succeeded()) {
-            resultHandler.handle(Future.succeededFuture(res2.result() != null));
+        // we need to take care of the transactionality of session data
+        res.result().get(session.id(), old -> {
+          final AbstractSession oldSession;
+          final AbstractSession newSession = (AbstractSession) session;
+          // only care if succeeded
+          if (old.succeeded()) {
+            oldSession = (AbstractSession) old.result();
           } else {
-            resultHandler.handle(Future.failedFuture(res2.cause()));
+            // either not existent or error getting it from the map
+            oldSession = null;
           }
+
+          if (oldSession != null) {
+            // there was already some stored data in this case we need to validate versions
+            if (oldSession.version() != newSession.version()) {
+              resultHandler.handle(Future.failedFuture("Version mismatch"));
+              return;
+            }
+          }
+
+          // we can now safely store the new version
+          newSession.incrementVersion();
+
+          res.result().put(session.id(), session, session.timeout(), res2 -> {
+            if (res2.succeeded()) {
+              resultHandler.handle(Future.succeededFuture());
+            } else {
+              resultHandler.handle(Future.failedFuture(res2.cause()));
+            }
+          });
         });
       } else {
         resultHandler.handle(Future.failedFuture(res.cause()));
@@ -104,12 +157,12 @@ public class ClusteredSessionStoreImpl implements ClusteredSessionStore {
   }
 
   @Override
-  public void clear(Handler<AsyncResult<Boolean>> resultHandler) {
+  public void clear(Handler<AsyncResult<Void>> resultHandler) {
     getMap(res -> {
       if (res.succeeded()) {
         res.result().clear(res2 -> {
           if (res2.succeeded()) {
-            resultHandler.handle(Future.succeededFuture(res2.result() != null));
+            resultHandler.handle(Future.succeededFuture());
           } else {
             resultHandler.handle(Future.failedFuture(res2.cause()));
           }
@@ -155,5 +208,4 @@ public class ClusteredSessionStoreImpl implements ClusteredSessionStore {
       resultHandler.handle(Future.succeededFuture(sessionMap));
     }
   }
-
 }

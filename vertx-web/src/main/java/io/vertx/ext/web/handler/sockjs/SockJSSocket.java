@@ -34,14 +34,13 @@ package io.vertx.ext.web.handler.sockjs;
 
 import io.vertx.codegen.annotations.Nullable;
 import io.vertx.codegen.annotations.VertxGen;
-import io.vertx.core.Handler;
-import io.vertx.core.MultiMap;
+import io.vertx.core.*;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.net.SocketAddress;
 import io.vertx.core.streams.ReadStream;
 import io.vertx.core.streams.WriteStream;
-import io.vertx.ext.web.Session;
 import io.vertx.ext.auth.User;
+import io.vertx.ext.web.Session;
 
 /**
  *
@@ -70,10 +69,35 @@ public interface SockJSSocket extends ReadStream<Buffer>, WriteStream<Buffer> {
   SockJSSocket resume();
 
   @Override
+  SockJSSocket fetch(long amount);
+
+  @Override
   SockJSSocket endHandler(Handler<Void> endHandler);
 
   @Override
-  SockJSSocket write(Buffer data);
+  default Future<Void> write(Buffer data) {
+    Promise<Void> promise = Promise.promise();
+    write(data, promise);
+    return promise.future();
+  }
+
+  /**
+   * Write a {@link String} to the socket, encoded in UTF-8.
+   *
+   * @param data  the string to write
+   */
+  default Future<Void> write(String data) {
+    Promise<Void> promise = Promise.promise();
+    write(data, promise);
+    return promise.future();
+  }
+
+  default void write(String data, Handler<AsyncResult<Void>> handler) {
+    write(Buffer.buffer(data), handler);
+  }
+
+  @Override
+  void write(Buffer data, Handler<AsyncResult<Void>> handler);
 
   @Override
   SockJSSocket setWriteQueueMaxSize(int maxSize);
@@ -82,25 +106,35 @@ public interface SockJSSocket extends ReadStream<Buffer>, WriteStream<Buffer> {
   SockJSSocket drainHandler(Handler<Void> handler);
 
   /**
-   * When a {@code SockJSSocket} is created it automatically registers an event handler with the event bus, the ID of that
+   * When a {@code SockJSSocket} is created it can register an event handler with the event bus, the ID of that
    * handler is given by {@code writeHandlerID}.
    * <p>
    * Given this ID, a different event loop can send a buffer to that event handler using the event bus and
    * that buffer will be received by this instance in its own event loop and written to the underlying socket. This
    * allows you to write data to other sockets which are owned by different event loops.
+   *
+   * @return the {@code writeHandlerID} or {@code null} if {@code writeHandler} registration is disabled in {@link SockJSHandlerOptions}
    */
   String writeHandlerID();
 
   /**
-   * Call {@link #end()}.
+   * Call {@link #close()}.
    */
   @Override
-  void end();
+  Future<Void> end();
 
   /**
    * Close it
    */
   void close();
+
+  /**
+   * Close it giving a status code and reason. Only Applicable to RawWebSocket will downgrade to plain close for
+   * other transports.
+   */
+  default void close(int statusCode, String reason) {
+    close();
+  }
 
   /**
    * Return the remote address for this socket

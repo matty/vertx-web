@@ -16,27 +16,27 @@
 
 package io.vertx.ext.web.handler.impl;
 
+import io.vertx.core.AsyncResult;
+import io.vertx.core.Future;
+import io.vertx.core.Handler;
 import io.vertx.core.MultiMap;
+import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.http.HttpServerRequest;
 import io.vertx.core.http.HttpServerResponse;
-import io.vertx.core.json.JsonObject;
-import io.vertx.core.logging.Logger;
-import io.vertx.core.logging.LoggerFactory;
+import io.vertx.core.impl.NoStackTraceThrowable;
+import io.vertx.ext.auth.authentication.AuthenticationProvider;
+import io.vertx.ext.auth.authentication.Credentials;
+import io.vertx.ext.auth.authentication.UsernamePasswordCredentials;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.Session;
 import io.vertx.ext.web.handler.FormLoginHandler;
-import io.vertx.ext.auth.AuthProvider;
-import io.vertx.ext.auth.User;
+import io.vertx.ext.web.impl.RoutingContextInternal;
 
 /**
  * @author <a href="http://tfox.org">Tim Fox</a>
  */
-public class FormLoginHandlerImpl implements FormLoginHandler {
-
-  private static final Logger log = LoggerFactory.getLogger(FormLoginHandlerImpl.class);
-
-  private final AuthProvider authProvider;
+public class FormLoginHandlerImpl extends AuthenticationHandlerImpl<AuthenticationProvider> implements FormLoginHandler {
 
   private String usernameParam;
   private String passwordParam;
@@ -67,9 +67,9 @@ public class FormLoginHandlerImpl implements FormLoginHandler {
     return this;
   }
 
-  public FormLoginHandlerImpl(AuthProvider authProvider, String usernameParam, String passwordParam,
+  public FormLoginHandlerImpl(AuthenticationProvider authProvider, String usernameParam, String passwordParam,
                               String returnURLParam, String directLoggedInOKURL) {
-    this.authProvider = authProvider;
+    super(authProvider);
     this.usernameParam = usernameParam;
     this.passwordParam = passwordParam;
     this.returnURLParam = returnURLParam;
@@ -77,55 +77,52 @@ public class FormLoginHandlerImpl implements FormLoginHandler {
   }
 
   @Override
-  public void handle(RoutingContext context) {
+  public void parseCredentials(RoutingContext context, Handler<AsyncResult<Credentials>> handler) {
     HttpServerRequest req = context.request();
     if (req.method() != HttpMethod.POST) {
-      context.fail(405); // Must be a POST
+      handler.handle(Future.failedFuture(BAD_METHOD)); // Must be a POST
     } else {
-      if (!req.isExpectMultipart()) {
-        throw new IllegalStateException("Form body not parsed - do you forget to include a BodyHandler?");
-      }
-      MultiMap params = req.formAttributes();
-      String username = params.get(usernameParam);
-      String password = params.get(passwordParam);
-      if (username == null || password == null) {
-        log.warn("No username or password provided in form - did you forget to include a BodyHandler?");
-        context.fail(400);
+      if (!((RoutingContextInternal) context).seenHandler(RoutingContextInternal.BODY_HANDLER)) {
+        handler.handle(Future.failedFuture(new NoStackTraceThrowable("BodyHandler is required to process POST requests")));
       } else {
-        Session session = context.session();
-        JsonObject authInfo = new JsonObject().put("username", username).put("password", password);
-        authProvider.authenticate(authInfo, res -> {
-          if (res.succeeded()) {
-            User user = res.result();
-            context.setUser(user);
-            if (session != null) {
-              String returnURL = session.remove(returnURLParam);
-              if (returnURL != null) {
-                // Now redirect back to the original url
-                doRedirect(req.response(), returnURL);
-                return;
-              }
-            }
-            // Either no session or no return url
-            if (directLoggedInOKURL != null) {
-              // Redirect to the default logged in OK page - this would occur
-              // if the user logged in directly at this URL without being redirected here first from another
-              // url
-              doRedirect(req.response(), directLoggedInOKURL);
-            } else {
-              // Just show a basic page
-              req.response().end(DEFAULT_DIRECT_LOGGED_IN_OK_PAGE);
-            }
-          } else {
-            context.fail(403);  // Failed login
-          }
-        });
+        MultiMap params = req.formAttributes();
+        String username = params.get(usernameParam);
+        String password = params.get(passwordParam);
+        if (username == null || password == null) {
+          handler.handle(Future.failedFuture(BAD_REQUEST));
+        } else {
+          handler.handle(Future.succeededFuture(new UsernamePasswordCredentials(username, password)));
+        }
       }
     }
   }
 
+  @Override
+  public void postAuthentication(RoutingContext ctx) {
+    HttpServerRequest req = ctx.request();
+    Session session = ctx.session();
+    if (session != null) {
+      String returnURL = session.remove(returnURLParam);
+      if (returnURL != null) {
+        // Now redirect back to the original url
+        doRedirect(req.response(), returnURL);
+        return;
+      }
+    }
+    // Either no session or no return url
+    if (directLoggedInOKURL != null) {
+      // Redirect to the default logged in OK page - this would occur
+      // if the user logged in directly at this URL without being redirected here first from another
+      // url
+      doRedirect(req.response(), directLoggedInOKURL);
+    } else {
+      // Just show a basic page
+      req.response().end(DEFAULT_DIRECT_LOGGED_IN_OK_PAGE);
+    }
+  }
+
   private void doRedirect(HttpServerResponse response, String url) {
-    response.putHeader("location", url).setStatusCode(302).end();
+    response.putHeader(HttpHeaders.LOCATION, url).setStatusCode(302).end();
   }
 
   private static final String DEFAULT_DIRECT_LOGGED_IN_OK_PAGE = "" +

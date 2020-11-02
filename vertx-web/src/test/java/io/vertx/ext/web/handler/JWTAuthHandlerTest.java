@@ -19,9 +19,10 @@ package io.vertx.ext.web.handler;
 import io.vertx.core.Handler;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.core.json.JsonObject;
-import io.vertx.ext.auth.AuthProvider;
+import io.vertx.ext.auth.JWTOptions;
+import io.vertx.ext.auth.KeyStoreOptions;
 import io.vertx.ext.auth.jwt.JWTAuth;
-import io.vertx.ext.auth.jwt.JWTOptions;
+import io.vertx.ext.auth.jwt.JWTAuthOptions;
 import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.WebTestBase;
 import org.junit.Before;
@@ -36,12 +37,11 @@ public class JWTAuthHandlerTest extends WebTestBase {
 
   @Before
   public void setup() throws Exception {
-    JsonObject authConfig = new JsonObject().put("keyStore", new JsonObject()
-        .put("type", "jceks")
-        .put("path", "keystore.jceks")
-        .put("password", "secret"));
-
-    authProvider = JWTAuth.create(vertx, authConfig);
+    authProvider = JWTAuth.create(vertx, new JWTAuthOptions()
+      .setKeyStore(new KeyStoreOptions()
+        .setType("jceks")
+        .setPath("keystore.jceks")
+        .setPassword("secret")));
   }
 
   @Test
@@ -49,7 +49,7 @@ public class JWTAuthHandlerTest extends WebTestBase {
 
     Handler<RoutingContext> handler = rc -> {
       assertNotNull(rc.user());
-      assertEquals("paulo", rc.user().principal().getString("sub"));
+      assertEquals("paulo", rc.user().attributes().getJsonObject("accessToken").getString("sub"));
       rc.response().end("Welcome to the protected resource!");
     };
 
@@ -61,9 +61,7 @@ public class JWTAuthHandlerTest extends WebTestBase {
     }, 401, "Unauthorized", null);
 
     // Now try again with credentials
-    testRequest(HttpMethod.GET, "/protected/somepage", req -> {
-      req.putHeader("Authorization", "Bearer " + authProvider.generateToken(new JsonObject().put("sub", "paulo"), new JWTOptions()));
-    }, 200, "OK", "Welcome to the protected resource!");
+    testRequest(HttpMethod.GET, "/protected/somepage", req -> req.putHeader("Authorization", "Bearer " + authProvider.generateToken(new JsonObject().put("sub", "paulo"), new JWTOptions())), 200, "OK", "Welcome to the protected resource!");
 
   }
 
@@ -84,9 +82,9 @@ public class JWTAuthHandlerTest extends WebTestBase {
     // Now try again with bad token
     final String token = authProvider.generateToken(new JsonObject().put("sub", "paulo"), new JWTOptions());
 
-    testRequest(HttpMethod.GET, "/protected/somepage", req -> {
-      req.putHeader("Authorization", "Bearer x" + token);
-    }, 401, "Unauthorized", null);
+    testRequest(HttpMethod.GET, "/protected/somepage", req -> req.putHeader("Authorization", "Bearer x" + token), 401, "Unauthorized", null);
+
+    testRequest(HttpMethod.GET, "/protected/somepage", req -> req.putHeader("Authorization", "Basic " + token), 401, "Unauthorized", null);
 
   }
 }

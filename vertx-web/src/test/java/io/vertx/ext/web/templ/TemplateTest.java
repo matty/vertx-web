@@ -23,11 +23,14 @@ import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.http.HttpMethod;
 import io.vertx.ext.web.Route;
+import io.vertx.ext.web.common.template.TemplateEngine;
 import io.vertx.ext.web.handler.TemplateHandler;
-import io.vertx.ext.web.RoutingContext;
 import io.vertx.ext.web.impl.Utils;
 import io.vertx.ext.web.WebTestBase;
 import org.junit.Test;
+
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
 
 /**
  * @author <a href="http://tfox.org">Tim Fox</a>
@@ -75,7 +78,8 @@ public class TemplateTest extends WebTestBase {
   public void testTemplateEngineFail() throws Exception {
     TemplateEngine engine = new TestEngine(true);
     router.route().handler(TemplateHandler.create(engine, "somedir", "text/html"));
-    router.exceptionHandler(t -> {
+    router.errorHandler(500, ctx -> {
+      Throwable t = ctx.failure();
       assertEquals("eek", t.getMessage());
       testComplete();
     });
@@ -84,12 +88,31 @@ public class TemplateTest extends WebTestBase {
   }
 
   @Test
+  public void testTemplateEngineWithPathVariables() throws Exception {
+    TemplateEngine engine = new TestEngine(false);
+    router.route().handler(context -> {
+      context.put("foo", "badger");
+      context.put("bar", "fox");
+      context.next();
+    });
+    router.route("/:project/*").handler(TemplateHandler.create(engine, "somedir", "text/html"));
+    String expected =
+      "<html>\n" +
+        "<body>\n" +
+        "<h1>Test template</h1>\n" +
+        "foo is badger bar is fox<br>\n" +
+        "</body>\n" +
+        "</html>";
+    testRequest(HttpMethod.GET, "/1/test-template.html", 200, "OK", expected);
+  }
+
+  @Test
   public void testRenderDirectly() throws Exception {
     TemplateEngine engine = new TestEngine(false);
     router.route().handler(context -> {
       context.put("foo", "badger");
       context.put("bar", "fox");
-      engine.render(context, "somedir/test-template.html", res -> {
+      engine.render(context.data(), "somedir/test-template.html", res -> {
         if (res.succeeded()) {
           context.response().putHeader(HttpHeaders.CONTENT_TYPE, "text/html").end(res.result());
         } else {
@@ -120,16 +143,17 @@ public class TemplateTest extends WebTestBase {
     router.route().handler(context -> {
       context.put("foo", "badger");
       context.put("bar", "fox");
-      engine.render(context, "somedir/test-template.html", onSuccess(res -> {
+      engine.render(context.data(), "somedir/test-template.html", onSuccess(res -> {
         String rendered = res.toString();
-        assertEquals(expected, rendered);
+        final String actual = normalizeLineEndingsFor(res).toString();
+        assertEquals(expected, actual);
         context.response().putHeader(HttpHeaders.CONTENT_TYPE, "text/html");
         context.response().end(rendered);
         testComplete();
       }));
     });
 
-    testRequest(HttpMethod.GET, "/", 200, "OK", expected);
+    testRequestBuffer(HttpMethod.GET, "/", null, null, 200, "OK", Buffer.buffer(expected), true);
     await();
   }
 
@@ -143,16 +167,15 @@ public class TemplateTest extends WebTestBase {
     }
 
     @Override
-    public void render(RoutingContext context, String templateFileName, Handler<AsyncResult<Buffer>> handler) {
+    public void render(Map<String, Object> context, String templateFileName, Handler<AsyncResult<Buffer>> handler) {
       if (fail) {
         handler.handle(Future.failedFuture(new Exception("eek")));
       } else {
-        String templ = Utils.readFileToString(vertx, templateFileName);
-        String rendered = templ.replace("{foo}", context.get("foo"));
-        rendered = rendered.replace("{bar}", context.get("bar"));
+        String templ = vertx.fileSystem().readFileBlocking(templateFileName).toString(StandardCharsets.UTF_8);
+        String rendered = templ.replace("{foo}", (String) context.get("foo"));
+        rendered = rendered.replace("{bar}", (String) context.get("bar"));
         handler.handle(Future.succeededFuture(Buffer.buffer(rendered)));
       }
     }
-
   }
 }

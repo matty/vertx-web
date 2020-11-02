@@ -33,7 +33,7 @@ import io.vertx.ext.web.handler.impl.BodyHandlerImpl;
 public interface BodyHandler extends Handler<RoutingContext> {
 
   /**
-   * Default max size for a request body. -1 means unlimited
+   * Default max size for a request body = {@code -1} means unlimited
    */
   long DEFAULT_BODY_LIMIT = -1;
 
@@ -53,12 +53,27 @@ public interface BodyHandler extends Handler<RoutingContext> {
   boolean DEFAULT_DELETE_UPLOADED_FILES_ON_END = false;
 
   /**
+   * Default value of whether to pre-allocate the body buffer size according to the content-length HTTP request header
+   */
+  boolean DEFAULT_PREALLOCATE_BODY_BUFFER = false;
+
+  /**
    * Create a body handler with defaults
    *
    * @return the body handler
    */
   static BodyHandler create() {
     return new BodyHandlerImpl();
+  }
+
+  /**
+   * Create a body handler setting if it should handle file uploads
+   *
+   * @param handleFileUploads true if files upload should be handled
+   * @return the body handler
+   */
+  static BodyHandler create(boolean handleFileUploads) {
+    return new BodyHandlerImpl(handleFileUploads);
   }
 
   /**
@@ -72,9 +87,18 @@ public interface BodyHandler extends Handler<RoutingContext> {
   }
 
   /**
-   * Set the maximum body size -1 means unlimited
+   * Set whether file uploads will be handled
    *
-   * @param bodyLimit  the max size
+   * @param handleFileUploads  true if they should be handled
+   * @return reference to this for fluency
+   */
+  @Fluent
+  BodyHandler setHandleFileUploads(boolean handleFileUploads);
+
+  /**
+   * Set the maximum body size in bytes, {@code -1} means no limit
+   *
+   * @param bodyLimit  the max size in bytes
    * @return reference to this for fluency
    */
   @Fluent
@@ -106,5 +130,16 @@ public interface BodyHandler extends Handler<RoutingContext> {
    */
   @Fluent
   BodyHandler setDeleteUploadedFilesOnEnd(boolean deleteUploadedFilesOnEnd);
+
+  /**
+   * Pre-allocate the body buffer according to the value parsed from content-length header.
+   * The buffer is capped at 64KB
+   * @param isPreallocateBodyBuffer {@code true} if body buffer is pre-allocated according to the size
+   *                               read from content-length Header.
+   *                               {code false} if body buffer is pre-allocated to 1KB, and is resized dynamically
+   * @return reference to this for fluency
+   */
+  @Fluent
+  BodyHandler setPreallocateBodyBuffer(boolean isPreallocateBodyBuffer);
 
 }
